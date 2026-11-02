@@ -1,7 +1,7 @@
 /** Structured startup and configuration errors with the settings location where the operator can fix them. */
 import { fill } from './infra/text.ts'
 
-export type SetupPlace = 'deployment' | 'github' | 'feishu'
+export type SetupPlace = 'deployment' | 'github' | 'feishu' | 'ones'
 export const SETUP_PROBLEMS = {
   foreignFile: ['deployment', '{file} was not written by dsh-superagent; move it, or choose another state directory.'],
   gitTooOld: ['deployment', 'git does not read the github.com credential configuration dsh-superagent writes; dsh-superagent needs git 2.32 or later.'],
@@ -19,6 +19,13 @@ export const SETUP_PROBLEMS = {
   feishuBotNotReady: ['feishu', 'The bot identity of app {app} is {status}; configure the app secret with lark-cli.'],
   feishuUserIdentity: ['feishu', 'The bot lark-cli allows user identities (strict mode {mode}); give the bot its own lark-cli configuration in strict mode bot, as docs/006-deployment.md describes.'],
   feishuNoBot: ['feishu', 'The Feishu bot API did not return the bot\'s open_id.'],
+  onesCliFailed: ['ones', 'The agent ONES CLI does not work.'],
+  onesUrlUnset: ['ones', 'The ONES Source names no instance URL.'],
+  onesProjectUnset: ['ones', 'The ONES Source names no watched project.'],
+  onesCliUnset: ['ones', 'The agent ONES CLI is not set.'],
+  onesNoAccount: ['ones', 'The agent ONES CLI did not report a ONES user.'],
+  onesProjectUnreadable: ['ones', '{account} cannot read ONES project {project}.'],
+  onesProjectUnreported: ['ones', 'The agent ONES CLI did not return project {project}.'],
 } as const satisfies Record<string, readonly [SetupPlace, string]>
 export type SetupCode = keyof typeof SETUP_PROBLEMS
 export interface SetupProblem { place: SetupPlace; code: SetupCode; values: Record<string, string>; detail: string }

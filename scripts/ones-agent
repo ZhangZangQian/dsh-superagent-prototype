@@ -1,0 +1,103 @@
+#!/bin/sh
+# ones-agent: a small ONES CLI wrapper for dsh-superagent, following the gh-agent pattern.
+# Credentials live in the directory ONES_CONFIG_DIR points at (base URL, team UUID, API token) — never in the panel, never in chat.
+# Subcommands print stable JSON on stdout:
+#   ones api user                                   -> {"uuid": "...", "name": "..."}
+#   ones list issues --project <uuid> --changed-since <ms>   -> {"items": [task, ...]}
+#   ones get issue --id <uuid>                      -> task
+#   ones list activities --id <uuid> [--after <uuid>] -> {"items": [activity, ...], "next": "<uuid>"}
+#   ones list comments --id <uuid> --page <n>       -> {"items": [comment, ...], "next_page": 2}
+#   ones add comment --issue <uuid> --body <text> --marker <id>  -> {}
+#   ones list members                               -> {"items": [{"uuid": "...", "name": "..."}]}
+# A task is {"uuid","title","issueStatusName","issueStatusIdentifier","owner":{"uuid","name"},"creator":{...},
+# "description","createdAt","updatedAt","url"}; a comment replaces owner with "writer"; an activity is
+# {"uuid","action","at","operator":{"uuid","name","automation"},"to":{...},"comment":{...}}; `action` values include
+# "update_issue_owner" (the assignment), "create_comment", "update_issue_status"; timestamps are epoch milliseconds.
+set -eu
+
+config="${ONES_CONFIG_DIR:-$HOME/.config/ones-agent}"
+base=$(cat "$config/url" 2>/dev/null || :)
+team=$(cat "$config/team" 2>/dev/null || :)
+token=$(cat "$config/token" 2>/dev/null || :)
+[ -n "$base" ] && [ -n "$team" ] && [ -n "$token" ] || { echo "ones-agent: incomplete configuration in $config (need url, team, token)" >&2; exit 1; }
+
+api() {
+  method=$1; path=$2; body=${3:-}
+  if [ -n "$body" ]; then
+    curl -sS -X "$method" -H "Ones-User-UUID: " -H " Ones-Plugin-Token: $token" --data "$body" "$base$path"
+  else
+    curl -sS -X "$method" -H "Ones-User-UUID: " -H " Ones-Plugin-Token: $token" "$base$path"
+  fi
+}
+
+command=${1:-}; [ $# -gt 0 ] && shift
+case "$command" in
+  api)
+    [ "${1:-}" = user ] || { echo "ones-agent: unknown api resource: ${1:-}" >&2; exit 1; }
+    api GET "/project/api/project/auth/user"
+    ;;
+  list)
+    case "${1:-}" in
+      issues)
+        project=; since=0
+        while [ $# -gt 0 ]; do case "$1" in
+          --project) project=$2; shift 2 ;;
+          --changed-since) since=$2; shift 2 ;;
+          *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+        esac; done
+        [ -n "$project" ] || { echo "ones-agent: --project is required" >&2; exit 1; }
+        api GET "/project/api/project/team/$team/issues/list?project=$project&changed_since=$since"
+        ;;
+      activities)
+        id=; after=
+        while [ $# -gt 0 ]; do case "$1" in
+          --id) id=$2; shift 2 ;;
+          --after) after=$2; shift 2 ;;
+          *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+        esac; done
+        [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
+        api GET "/project/api/project/team/$team/issue/$id/activities${after:+?after=$after}"
+        ;;
+      comments)
+        id=; page=1
+        while [ $# -gt 0 ]; do case "$1" in
+          --id) id=$2; shift 2 ;;
+          --page) page=$2; shift 2 ;;
+          *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+        esac; done
+        [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
+        api GET "/project/api/project/team/$team/issue/$id/comments?page=$page"
+        ;;
+      members)
+        api GET "/project/api/project/team/$team/members"
+        ;;
+      *) echo "ones-agent: unknown list resource: ${1:-}" >&2; exit 1 ;;
+    esac
+    ;;
+  get)
+    [ "${1:-}" = issue ] || { echo "ones-agent: unknown get resource: ${1:-}" >&2; exit 1; }
+    id=
+    while [ $# -gt 0 ]; do case "$1" in --id) id=$2; shift 2 ;; *) shift ;; esac; done
+    [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
+    api GET "/project/api/project/team/$team/issue/$id"
+    ;;
+  add)
+    [ "${1:-}" = comment ] || { echo "ones-agent: unknown add resource: ${1:-}" >&2; exit 1; }
+    issue=; body=; marker=
+    while [ $# -gt 0 ]; do case "$1" in
+      --issue) issue=$2; shift 2 ;;
+      --body) body=$2; shift 2 ;;
+      --marker) marker=$2; shift 2 ;;
+      *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+    esac; done
+    [ -n "$issue" ] && [ -n "$body" ] || { echo "ones-agent: --issue and --body are required" >&2; exit 1; }
+    # The marker makes a retried delivery idempotent: a comment already carrying it is not posted again.
+    if [ -n "$marker" ] && api GET "/project/api/project/team/$team/issue/$issue/comments?page=1" \
+        | grep -Fq "<!-- $marker -->"; then
+      echo '{}'
+      exit 0
+    fi
+    api POST "/project/api/project/team/$team/issue/$issue/comments" "{\"content\":\"$body\",\"marker\":\"$marker\"}"
+    ;;
+  *) echo "usage: ones-agent api user | list issues|activities|comments|members | get issue | add comment" >&2; exit 1 ;;
+esac

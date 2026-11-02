@@ -47,15 +47,25 @@ export const GithubAccountsSchema = z.object({
   cli: z.string().trim().default(''),
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
+export const OnesModuleAccountSchema = z.object({
+  url: z.string().trim().regex(/^https?:\/\/[^/]+/, 'http(s) base URL').default(''),
+  project: z.string().trim().regex(/^[A-Za-z0-9]{8,64}$/, 'project UUID').default(''),
+  cli: z.string().trim().default(''),
+})
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape), ones: Object.keys(OnesModuleAccountSchema.shape),
+}
 
 export interface Deployment extends Machine {
   repository: string
   github: { cli: string; login: string; noreply: string }
   feishu?: FeishuBot
+  ones?: OnesAccount
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
+/** The agent's ONES account: its wrapper CLI, the instance's base URL, and the account's user UUID. */
+export interface OnesAccount { cli: string; url: string; project: string; user: string; name: string }
 
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {
@@ -128,4 +138,30 @@ export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe:
   const info = parsed(BotInfo, (await run('api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot', '--format', 'ndjson')).split('\n')[0] ?? '')
   if (!info) return fail(new SetupError('feishuNoBot'))
   return { cli, appId: status.appId, brand: status.brand, botId: info.bot.open_id, name: info.bot.app_name }
+}
+
+const OnesModuleUser = z.object({ uuid: z.string().regex(/^[A-Za-z0-9]{8,64}$/), name: z.string().default('') })
+/**
+ * Verify the agent's ONES wrapper: it must name the instance and project, sign in as one account, and that account must
+ * read the watched project. A failure disables only the ONES Source, as a Feishu bot failure disables only Feishu.
+ */
+export async function resolveOnesAccount(machine: Machine, ones: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<OnesAccount | undefined> {
+  const account = OnesModuleAccountSchema.parse(ones ?? {})
+  if (!account.cli && !account.url && !account.project) return undefined
+  const fail = (error: unknown): never => { throw error instanceof SetupError ? error : new SetupError('onesCliFailed', { output: reason(error) }) }
+  if (!account.url) throw new SetupError('onesUrlUnset')
+  if (!account.project) throw new SetupError('onesProjectUnset')
+  if (!account.cli) throw new SetupError('onesCliUnset')
+  let cli = ''
+  try { cli = executable(account.cli, path, workerBin(machine.stateDir)) } catch (error) { fail(error) }
+  const run = (...args: string[]): Promise<string> => probe([cli, ...args]).catch(fail)
+  const user = parsed(OnesModuleUser, await run('api', 'user'))
+  if (!user) return fail(new SetupError('onesNoAccount'))
+  // `list issues --changed-since` with a past cursor is the cheapest read the poll performs; it doubles as the project check.
+  const project = await run('list', 'issues', '--project', account.project, '--changed-since', '0')
+    .catch((error: unknown) => { throw new SetupError('onesProjectUnreadable', { account: user.name || user.uuid, project: account.project, output: reason(error) }) })
+  if (parsed(z.looseObject({ items: z.array(z.unknown()) }), project) === undefined) {
+    throw new SetupError('onesProjectUnreported', { project: account.project })
+  }
+  return { cli, url: account.url, project: account.project, user: user.uuid, name: user.name }
 }
