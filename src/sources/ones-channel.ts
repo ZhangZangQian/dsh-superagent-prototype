@@ -7,10 +7,11 @@ import { onesPage } from './ones-trigger.ts'
 import { onesAddComment } from './ones-read.ts'
 
 /** Posts a comment on the task the Channel names; the embedded marker makes an Outbox retry idempotent (the gh-agent pattern). */
-export async function sendOnes(host: Pick<SourceContext, 'commands' | 'deployment'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
+export async function sendOnes(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { project, issue } = message.channel.address
   if (!project || !issue) throw new Error('Missing ONES reply target')
-  const cli = host.deployment.ones?.cli ?? 'ones'
+  // The registry passes only `commands`; its deployment carries the resolved ONES account (the github-channel pattern).
+  const cli = host.commands.deployment.ones?.cli ?? 'ones'
   await onesAddComment(host.commands, cli, issue, checkedImText(message.text), message.id)
   return 'sent'
 }

@@ -1,6 +1,7 @@
 #!/bin/sh
 # ones-agent: a small ONES CLI wrapper for dsh-superagent, following the gh-agent pattern.
 # Credentials live in the directory ONES_CONFIG_DIR points at (base URL, team UUID, API token) — never in the panel, never in chat.
+# Transport: stateless MCP over HTTP (POST /mcp, Bearer token); each subcommand is one tools/call.
 # Subcommands print stable JSON on stdout:
 #   ones api user                                   -> {"uuid": "...", "name": "..."}
 #   ones list issues --project <uuid> --changed-since <ms>   -> {"items": [task, ...]}
@@ -21,83 +22,312 @@ team=$(cat "$config/team" 2>/dev/null || :)
 token=$(cat "$config/token" 2>/dev/null || :)
 [ -n "$base" ] && [ -n "$team" ] && [ -n "$token" ] || { echo "ones-agent: incomplete configuration in $config (need url, team, token)" >&2; exit 1; }
 
-api() {
-  method=$1; path=$2; body=${3:-}
-  if [ -n "$body" ]; then
-    curl -sS -X "$method" -H "Ones-User-UUID: " -H " Ones-Plugin-Token: $token" --data "$body" "$base$path"
-  else
-    curl -sS -X "$method" -H "Ones-User-UUID: " -H " Ones-Plugin-Token: $token" "$base$path"
-  fi
+# call <tool> <json-arguments> — prints the tool's structured/text content as JSON on stdout.
+call() {
+  tool=$1; args=${2:-'{}'}
+  payload=$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$tool" "$args")
+  body=$(curl -sS -X POST "$base/mcp" -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "$payload")
+  # SSE or JSON body: find the data: line or the raw object
+  line=$(printf '%s\n' "$body" | grep -m1 '^data:') || true
+  if [ -n "$line" ]; then rpc=$(printf '%s\n' "$line" | sed 's/^data: //'); else rpc=$body; fi
+  # surface JSON-RPC errors and tool errors as failures
+  err=$(printf '%s\n' "$rpc" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("ones-agent: unreadable MCP response"); sys.exit(1)
+if "error" in d:
+    print("ones-agent: MCP error: " + json.dumps(d["error"], ensure_ascii=False)); sys.exit(1)
+result = d.get("result", {})
+if result.get("isError"):
+    text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+    print("ones-agent: tool error: " + (text or "unknown")); sys.exit(1)
+structured = result.get("structuredContent")
+if structured is not None:
+    print(json.dumps(structured, ensure_ascii=False))
+else:
+    text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+    print(text if text else "{}")
+' 2>/dev/null) || { printf '%s\n' "$err" >&2; exit 1; }
+  printf '%s\n' "$err"
 }
+
+# json_get <python-expr over d> — helper to reshape tool output into the wrapper contract.
+python3 - "$@" <<'PYEOF' 2>/dev/null || true
+PYEOF
 
 command=${1:-}; [ $# -gt 0 ] && shift
 case "$command" in
   api)
-    [ "${1:-}" = user ] || { echo "ones-agent: unknown api resource: ${1:-}" >&2; exit 1; }
-    api GET "/project/api/project/auth/user"
+    case "${1:-}" in
+      user) shift || true
+            call who_am_i '{}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"uuid": d.get("uuid",""), "name": d.get("name","")}, ensure_ascii=False))' ;;
+      *) echo "ones-agent: unknown api resource: ${1:-}" >&2; exit 1 ;;
+    esac
     ;;
   list)
-    case "${1:-}" in
+    resource=${1:-}; [ $# -gt 0 ] && shift
+    case "$resource" in
       issues)
         project=; since=0
-        while [ $# -gt 0 ]; do case "$1" in
+        while [ $# -gt 0 ]; do case $1 in
           --project) project=$2; shift 2 ;;
           --changed-since) since=$2; shift 2 ;;
           *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
         esac; done
         [ -n "$project" ] || { echo "ones-agent: --project is required" >&2; exit 1; }
-        api GET "/project/api/project/team/$team/issues/list?project=$project&changed_since=$since"
+        # OneSQL page over the project, newest updated first; field003/field004/field005/field007 selected bare AND .name where supported
+        q=$(printf 'SELECT uuid, field001, field002, field003, field003.name, field004, field004.name, field005.name, field007.name, TODATE(field009, '\''YYYY-MM-DD HH:mm:ss'\''), TODATE(field010, '\''YYYY-MM-DD HH:mm:ss'\''), field903 FROM issue WHERE v$cursor > '\'''\'' AND field006 = '\''%s'\'' ORDER BY field010 DESC LIMIT 1000, 50' "$project")
+        args=$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$q")
+        out=$(call query_issues_by_onesql "$args")
+        roster=$(call get_project_members "{\"projectID\": \"$project\"}" 2>/dev/null || echo '{}')
+        me=$(call who_am_i '{}' 2>/dev/null || echo '{}')
+        ms=${since:-0}
+        printf '%s\n' "$out" | ONES_PROJECT="$project" ONES_BASE="$base" ONES_TEAM="$team" SINCE="$ms" ONES_MEMBERS="$roster" ONES_ME="$me" python3 -c '
+import json, sys, os, datetime
+d = json.load(sys.stdin)
+items = d.get("data") or []
+raw = os.environ.get("SINCE") or "0"
+def parse_since(v):
+    # the Source passes an ISO timestamp; the contract also allows epoch ms
+    try: return int(float(v))
+    except ValueError: pass
+    try:
+        return int(datetime.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()*1000)
+    except Exception:
+        return 0
+since_ms = parse_since(raw)
+def to_ms(v):
+    try: return int(datetime.datetime.strptime(v, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()*1000)
+    except Exception:
+        try: return int(datetime.datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp()*1000)
+        except Exception: return 0
+out = []
+def ref_name(v):
+    # OneSQL returns nameables as {"name": "..."} in some builds, plain string in others
+    if isinstance(v, dict): return v.get("name") or ""
+    return v or ""
+# name->uuid resolution: who_am_i gives the agent account {uuid,name}; roster ids are used only for presence
+members = {}
+try:
+    me = json.loads(os.environ.get("ONES_ME") or "{}")
+    if isinstance(me, dict) and me.get("name"): members[me["name"]] = me.get("uuid") or me.get("id") or ""
+except Exception: pass
+try:
+    members_raw = json.loads(os.environ.get("ONES_MEMBERS") or "{}")
+    for m in members_raw:
+        if isinstance(m, dict) and m.get("name"): members[m["name"]] = m.get("uuid") or m.get("id") or ""
+except Exception: pass
+def uuid_of(name):
+    return members.get(name, "")
+for it in items:
+    item = it.get("item", it)
+    upd = to_ms(item.get("field010") or "")
+    if since_ms and upd and upd <= since_ms: continue
+    def ref(field):
+        # OneSQL: bare field returns "field003": {"name": "..."} when .name is also selected; bare-only returns the id string
+        v = item.get(field)
+        if isinstance(v, dict): return {"uuid": v.get("uuid",""), "name": v.get("name") or ""}
+        if isinstance(v, str): return {"uuid": v, "name": ""}
+        return {"uuid": "", "name": ""}
+    out.append({"uuid": item.get("uuid",""), "title": item.get("field001",""),
+      "description": item.get("field002") or "",
+      "creator": ref("field003"),
+      "owner": ref("field004"),
+      "issueStatusName": (item.get("field005") or {}).get("name","") if isinstance(item.get("field005"), dict) else (item.get("field005.name") or {}).get("name","") if isinstance(item.get("field005.name"), dict) else "",
+      "issueStatusIdentifier": "",
+      "issueType": (item.get("field007.name") or {}).get("name","") if isinstance(item.get("field007.name"), dict) else (item.get("field007.name") or ""),
+      "key": item.get("field903") or "",
+      "createdAt": to_ms(item.get("field009") or ""), "updatedAt": upd,
+      "url": os.environ.get("ONES_BASE","") + "/project/#/team/" + os.environ.get("ONES_TEAM","") + "/task/" + item.get("uuid","")})
+# fill owner/creator uuids by name where possible (the agent name resolves via who_am_i)
+for row in out:
+    if not row["owner"]["uuid"] and row["owner"]["name"]: row["owner"]["uuid"] = uuid_of(row["owner"]["name"])
+    if not row["creator"]["uuid"] and row["creator"]["name"]: row["creator"]["uuid"] = uuid_of(row["creator"]["name"])
+print(json.dumps({"items": out}, ensure_ascii=False))
+'
         ;;
       activities)
         id=; after=
-        while [ $# -gt 0 ]; do case "$1" in
+        while [ $# -gt 0 ]; do case $1 in
           --id) id=$2; shift 2 ;;
           --after) after=$2; shift 2 ;;
           *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
         esac; done
         [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
-        api GET "/project/api/project/team/$team/issue/$id/activities${after:+?after=$after}"
+        args=$(python3 -c 'import json,sys; print(json.dumps({"issueIDs":[sys.argv[1]],"sinceDateTime":"2000-01-01T00:00:00+08:00"}))' "$id")
+        me=$(call who_am_i '{}' 2>/dev/null || echo '{}')
+        call get_issue_activities "$args" | ISSUE="$id" ONES_ME="$me" python3 -c '
+import json, sys, os, re, datetime, hashlib
+d = json.load(sys.stdin)
+# unwrap {"result":"SUCCESS","data":{issue:{...}}} if present
+if isinstance(d, dict) and isinstance(d.get("data"), dict): d = d["data"]
+raw = d.get(os.environ["ISSUE"]) if isinstance(d, dict) else None
+if isinstance(raw, dict): raw = raw.get("issue_activities") or []
+if not isinstance(raw, list): raw = []
+me = {}
+try:
+    me = json.loads(os.environ.get("ONES_ME") or "{}")
+except Exception: pass
+me_name = me.get("name") or ""
+me_uuid = me.get("uuid") or me.get("id") or ""
+acts = []
+for entry in raw:
+    text = entry if isinstance(entry, str) else json.dumps(entry, ensure_ascii=False)
+    m_time = re.search(r"<time>([^<]+)</time>", text)
+    m_user = re.search(r"<user>([^<]+)</user>", text)
+    ts = ""
+    if m_time:
+        s = m_time.group(1)
+        for fmt in ("%Y年%m月%d日 %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                ts = datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone(datetime.timedelta(hours=8))).isoformat(); break
+            except ValueError: continue
+    actor = m_user.group(1) if m_user else ""
+    actor_uuid = me_uuid if actor and actor == me_name else ""
+    # classify the sentence into the structured activity the contract expects
+    action = "update"
+    to = None
+    comment = None
+    if re.search(r"创建了|created (the )?(task|issue)", text): action = "create_issue"
+    elif re.search(r"负责人|owner|assign", text):
+        action = "update_issue_owner"
+        # the sentence writes: set <field>负责人</field> to <value>NAME</value>; the value names the new owner
+        tail = text.split("负责人",1)[-1] if "负责人" in text else text.split("owner",1)[-1]
+        m_val = re.search(r"<(?:value|user)>([^<]+)</(?:value|user)>", tail)
+        name = (m_val.group(1) if m_val else "")
+        to_uuid = me_uuid if name and name == me_name else ""
+        to = {"uuid": to_uuid, "name": name} if name else None
+    elif re.search(r"评论|comment", text):
+        action = "create_comment"
+        m_body = re.search(r"<comment>([^<]*)</comment>", text)
+        comment = {"uuid": hashlib.sha1(("c"+text).encode()).hexdigest()[:16], "writer": {"uuid": actor_uuid, "name": actor}, "content": m_body.group(1) if m_body else text, "createdAt": ts, "updatedAt": ts}
+    elif re.search(r"状态|status", text): action = "update_issue_status"
+    acts.append({"uuid": hashlib.sha1(text.encode()).hexdigest()[:16], "action": action, "at": ts,
+                 "operator": {"uuid": actor_uuid, "name": actor}, **({"to": to} if to else {}), **({"comment": comment} if comment else {})})
+print(json.dumps({"items": acts}, ensure_ascii=False))
+'
         ;;
       comments)
         id=; page=1
-        while [ $# -gt 0 ]; do case "$1" in
+        while [ $# -gt 0 ]; do case $1 in
           --id) id=$2; shift 2 ;;
           --page) page=$2; shift 2 ;;
           *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
         esac; done
         [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
-        api GET "/project/api/project/team/$team/issue/$id/comments?page=$page"
+        args=$(python3 -c 'import json,sys; print(json.dumps({"issueID": sys.argv[1]}))' "$id")
+        call get_list_of_issue_comments "$args" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if isinstance(d, dict):
+    data = d.get("data")
+    if isinstance(data, dict): data = data.get("list") or data.get("items") or []
+    items = data if isinstance(data, list) else d.get("list") or d.get("items") or []
+else:
+    items = d if isinstance(d, list) else []
+if not isinstance(items, list): items = []
+print(json.dumps({"items": items}, ensure_ascii=False))
+'
         ;;
       members)
-        api GET "/project/api/project/team/$team/members"
+        # The MCP tool needs a project; accept --project for parity with `list issues`, else ONES_PROJECT
+        project=
+        while [ $# -gt 0 ]; do case $1 in
+          --project) project=$2; shift 2 ;;
+          *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+        esac; done
+        [ -n "$project" ] || project=${ONES_PROJECT:-}
+        [ -n "$project" ] || { echo "ones-agent: --project is required (or set ONES_PROJECT)" >&2; exit 1; }
+        call get_project_members "{\"projectID\": \"$project\"}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ids = []
+if isinstance(d, dict):
+    data = d.get("data")
+    if isinstance(data, dict):
+        for group in data.get("roleMembers") or []:
+            ids.extend(group.get("members") or [])
+    elif isinstance(data, list): ids = data
+seen = set(); unique = [i for i in ids if not (i in seen or seen.add(i))]
+print(json.dumps({"items": [{"uuid": i, "name": ""} for i in unique]}, ensure_ascii=False))
+'
         ;;
       *) echo "ones-agent: unknown list resource: ${1:-}" >&2; exit 1 ;;
     esac
     ;;
   get)
-    [ "${1:-}" = issue ] || { echo "ones-agent: unknown get resource: ${1:-}" >&2; exit 1; }
-    id=
-    while [ $# -gt 0 ]; do case "$1" in --id) id=$2; shift 2 ;; *) shift ;; esac; done
-    [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
-    api GET "/project/api/project/team/$team/issue/$id"
+    resource=${1:-}; [ $# -gt 0 ] && shift
+    case "$resource" in
+      issue)
+        id=
+        while [ $# -gt 0 ]; do case $1 in --id) id=$2; shift 2 ;; *) shift ;; esac; done
+        [ -n "$id" ] || { echo "ones-agent: --id is required" >&2; exit 1; }
+        args=$(python3 -c 'import json,sys; print(json.dumps({"issueID": sys.argv[1]}))' "$id")
+        call get_issue_details "$args" | BASE="$base" TEAM="$team" python3 -c '
+import json, sys, os, re, datetime
+d = json.load(sys.stdin)
+if isinstance(d, dict) and isinstance(d.get("data"), dict): d = d["data"]
+def ms(v):
+    v = v or 0
+    if isinstance(v, (int, float)):
+        return int(v // 1000) if v > 10**14 else int(v)
+    try:
+        s = str(v)
+        if re.fullmatch(r"\d+", s): return int(s) // 1000 if len(s) > 14 else int(s)
+        return int(datetime.datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()*1000)
+    except Exception: return 0
+def strip_html(t):
+    return re.sub(r"<[^>]+>", "", t or "").strip()
+assignee = d.get("assignee") or {}
+creator = d.get("creator") or {}
+status = d.get("status") if isinstance(d.get("status"), dict) else {}
+print(json.dumps({
+  "uuid": str(d.get("uuid") or d.get("id") or ""),
+  "title": strip_html(d.get("title") or d.get("name") or ""),
+  "issueStatusName": status.get("name", ""), "issueStatusIdentifier": status.get("id", ""),
+  "owner": {"uuid": assignee.get("id",""), "name": assignee.get("name","")},
+  "creator": {"uuid": creator.get("id",""), "name": creator.get("name","")},
+  "description": strip_html(d.get("description") or d.get("content") or ""),
+  "createdAt": ms(d.get("createTime")), "updatedAt": ms(d.get("updateTime") or d.get("createTime")),
+  "url": os.environ.get("BASE","").rstrip("/") + "/project/#/team/" + os.environ.get("TEAM","") + "/task/" + str(d.get("uuid") or d.get("id") or ""),
+}, ensure_ascii=False))
+'
+        ;;
+      *) echo "ones-agent: unknown get resource: ${1:-}" >&2; exit 1 ;;
+    esac
     ;;
   add)
-    [ "${1:-}" = comment ] || { echo "ones-agent: unknown add resource: ${1:-}" >&2; exit 1; }
-    issue=; body=; marker=
-    while [ $# -gt 0 ]; do case "$1" in
-      --issue) issue=$2; shift 2 ;;
-      --body) body=$2; shift 2 ;;
-      --marker) marker=$2; shift 2 ;;
-      *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
-    esac; done
-    [ -n "$issue" ] && [ -n "$body" ] || { echo "ones-agent: --issue and --body are required" >&2; exit 1; }
-    # The marker makes a retried delivery idempotent: a comment already carrying it is not posted again.
-    if [ -n "$marker" ] && api GET "/project/api/project/team/$team/issue/$issue/comments?page=1" \
-        | grep -Fq "<!-- $marker -->"; then
-      echo '{}'
-      exit 0
-    fi
-    api POST "/project/api/project/team/$team/issue/$issue/comments" "{\"content\":\"$body\",\"marker\":\"$marker\"}"
+    resource=${1:-}; [ $# -gt 0 ] && shift
+    case "$resource" in
+      comment)
+        issue=; body=; marker=
+        while [ $# -gt 0 ]; do case $1 in
+          --issue) issue=$2; shift 2 ;;
+          --body) body=$2; shift 2 ;;
+          --marker) marker=$2; shift 2 ;;
+          *) echo "ones-agent: unknown option: $1" >&2; exit 1 ;;
+        esac; done
+        [ -n "$issue" ] && [ -n "$body" ] || { echo "ones-agent: --issue and --body are required" >&2; exit 1; }
+        # The marker makes a retried delivery idempotent: a comment already carrying it is not posted again.
+        if [ -n "$marker" ]; then
+          args=$(python3 -c 'import json,sys; print(json.dumps({"issueID": sys.argv[1]}))' "$issue")
+          existing=$(call get_list_of_issue_comments "$args" || echo '{}')
+          already=$(printf '%s\n' "$existing" | grep -Fq "<!-- $marker -->" && echo yes || echo no)
+          if [ "$already" = yes ]; then echo '{}'; exit 0; fi
+        fi
+        text="$body"
+        [ -n "$marker" ] && text="$body
+
+<!-- $marker -->"
+        args=$(python3 -c 'import json,sys; a=sys.argv[1]; b=sys.argv[2]; print(json.dumps({"issueID": a, "text": b}, ensure_ascii=False))' "$issue" "$text")
+        call post_issue_comment "$args"
+        ;;
+      *) echo "ones-agent: unknown add resource: ${1:-}" >&2; exit 1 ;;
+    esac
     ;;
   *) echo "usage: ones-agent api user | list issues|activities|comments|members | get issue | add comment" >&2; exit 1 ;;
 esac
