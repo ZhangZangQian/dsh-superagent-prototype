@@ -1,6 +1,6 @@
-# 007 ONES Source
+# 009 ONES Source
 
-> Status: design proposal, not yet implemented. This document extends the numbered series for a review audience; a merged implementation updates [006 Deployment](006-deployment.md) alongside.
+> Status: implemented. The kind lives in `src/sources/ones.ts` with its `-trigger`, `-read` and `-channel` modules, its plugin entry is exported as `./ones-watch` and inserted (disabled) by the bundle's `cordis.patch.yml`, and [006 Deployment](006-deployment.md) describes the account setup.
 
 ONES as a Source kind: assignment authorizes work. This document builds on [001 Domain model](001-domain.md) and [002 Authorization](002-authorization.md).
 
@@ -41,10 +41,10 @@ Channel address: `{ project, issue, comment? }`; `link()` builds the ONES web UR
 
 ## Policy part
 
-`policy.schema`: `{ allowed: [{id: onces user uuid, name?}], bots: [{id}], admission: table }`
-`sync` (optional): refresh `allowed` from the project's member list (ones `get_project_members`), mirroring the Feishu chat-member sync.
+`policy.schema`: `{ allowed: [{id: ones user uuid, name?}], syncProject: boolean, bots: [{id}] }`
+`sync` (optional, `syncProject`): refresh `allowed` from the project's member list (`ones list members`), mirroring the Feishu chat-member sync.
 
-Admission rows: `tasks` (new tasks in the project), `comments` (comments on non-agent tasks), `assignment` (assignment to the agent by an unlisted user). The `assignment` row's unlistedAddressed cell is the main knob: default `ignore`, `inferred` for a trial period, `explicit` never recommended.
+Admission rows: `mine` (comments and events on the agent's own tasks), `assignment` (assignment to the agent by an unlisted user), `tasks` (events on tasks not the agent's, with the receive switch on), `comments` (comments on non-agent tasks). The `assignment` row's unlistedAddressed cell is the main knob: default `ignore`, `inferred` for a trial period, `explicit` never recommended.
 
 ## Environment variables
 
@@ -55,15 +55,15 @@ Admission rows: `tasks` (new tasks in the project), `comments` (comments on non-
 | `DSH_SUPERAGENT_ONES_ISSUE` | The task that started the ticket; empty otherwise |
 | `DSH_SUPERAGENT_ONES_TASK_URL` | Web URL of that task |
 
-Workers call the CLI as `ones` (shimmed in `worker-bin` like `gh`/`lark-cli`); delivery comments use `add issue comment`.
+Workers call the CLI as `ones` (shimmed in `worker-bin` like `gh`/`lark-cli`); delivery comments use `add comment --issue --body --marker`, with the marker making retries idempotent.
 
 ## CLI wrapper (`ones-agent`)
 
-ONES has no official CLI, so the bundle ships a small wrapper script following the gh-agent pattern:
+ONES has no official CLI, so the repository ships a small wrapper script (`scripts/ones-agent`, following the gh-agent pattern):
 
 - Credentials in a separate config dir (`ONES_CONFIG_DIR`), holding base URL, team UUID, API token — never in the panel, never in chat.
-- Subcommands emit stable JSON on stdout: `api user` (whoami), `list issues --changed-since`, `get issue --id`, `list activities --id`, `add comment --id --body`, `list members`.
-- The Source's poll and channel call it through `Commands`; setup checks `api user` can read the project (and reports a setup problem when it cannot).
+- Subcommands emit stable JSON on stdout: `api user` (whoami), `list issues --project --changed-since`, `get issue --id`, `list activities --id [--after]`, `list comments --id --page`, `add comment --issue --body --marker`, `list members`. The contract, including the task/comment/activity shapes, is documented in the script's header and in the `dsh-superagent-ones` skill.
+- The Source's poll and channel call it through `Commands`; setup checks `api user` and that the account reads the project, reporting a setup problem when it cannot. A failure disables only the ONES Source, as a Feishu bot failure disables only Feishu.
 
 ## Scope guardrails
 
@@ -72,8 +72,9 @@ ONES has no official CLI, so the bundle ships a small wrapper script following t
 - No new domain concepts: no "sprint", no "sprint triggered" concept — if needed, sprint sync is prompt text for the worker.
 - Health entries: `ones` (poll), `sync:ones` (roster sync when enabled).
 
-## Open questions (for the review)
+## Resolved questions
 
-1. Does the team's ONES edition expose `get_issue_activities` with actor attribution for owner changes? (Determines assigner identification honesty; fallback documented above.)
-2. Should `observeTasks` include status-change triggers on non-agent tasks, or new tasks only, at first?
-3. Comment delivery: plain text only first (no rich text/attachments), matching the GitHub channel's simplicity?
+1. Assigner attribution comes from the activity record's operator, as the wrapper reports it. When the record names none, the trigger keeps an empty actor and the admission table decides — the mandate never guesses a sender.
+2. `observeTasks` receives both new tasks and status changes on non-agent tasks; comments on them need `observeComments`.
+3. Comment delivery is plain text first (no rich text/attachments), matching the GitHub channel's simplicity.
+4. Automation attribution: the wrapper marks workflow/integration operators with `automation: true` on the activity; the Source emits them as bot triggers (`human: false`), which the gate admits as inferred candidates at most, and only when the identity is on the Source's bot list.

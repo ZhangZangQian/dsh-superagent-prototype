@@ -72,10 +72,12 @@ The prepare command and Executor instructions receive the same execution variabl
 | `DSH_SUPERAGENT_GITHUB_ACCOUNT`, `DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL` | GitHub | The agent account and its commit email |
 | `DSH_SUPERAGENT_GITHUB_NUMBER`, `DSH_SUPERAGENT_GITHUB_PR_HEAD` | GitHub | The Issue or pull request that started the Ticket, and its head ref when it is a pull request |
 | `DSH_SUPERAGENT_FEISHU_BOT`, `DSH_SUPERAGENT_FEISHU_CHAT` | Feishu | The bot, and the chat that started the Ticket |
+| `DSH_SUPERAGENT_ONES_URL`, `DSH_SUPERAGENT_ONES_PROJECT` | ONES | The instance's base URL, and the watched project's UUID |
+| `DSH_SUPERAGENT_ONES_ISSUE`, `DSH_SUPERAGENT_ONES_TASK_URL` | ONES | The task that started the Ticket, and its web URL |
 
 Ticket-specific values come from its directory and originating Trigger. Other values come from the current deployment settings. Only the panel can change execution environment settings; text sent to the main Session cannot change the configured shell command.
 
-Workers reach GitHub through the agent account's `gh` and Feishu through the bot's `lark-cli`. Blocked commands fail when invoked by name.
+Workers reach GitHub through the agent account's `gh`, Feishu through the bot's `lark-cli`, and ONES through the agent's `ones` wrapper. Blocked commands fail when invoked by name.
 
 These wrappers and directories establish defaults, not a security boundary. A worker can still execute a program by absolute path.
 

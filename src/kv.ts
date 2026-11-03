@@ -55,4 +55,6 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /** ONES Source: the project poll's edited-since cursor, and the per-task activity-read cursor. */
+  ones: { since: record<string>('ones-since'), cursor: family<string, [issue: string]>('ones-cursor:') },
 }
